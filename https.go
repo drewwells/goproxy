@@ -2,8 +2,10 @@ package goproxy
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -12,7 +14,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type ConnectActionLiteral int
@@ -61,6 +65,133 @@ func (proxy *ProxyHttpServer) connectDial(network, addr string) (c net.Conn, err
 	return proxy.ConnectDial(network, addr)
 }
 
+var ctMu sync.RWMutex
+var currentTransfers int
+
+func id() string {
+	bs := make([]byte, 2)
+	rand.Read(bs)
+	return fmt.Sprintf("%x", bs)
+}
+
+func reportOpenTransfers() {
+	go func() {
+		for {
+			time.Sleep(time.Second * 10)
+			ctMu.RLock()
+			fmt.Println(currentTransfers, "open Transfers")
+			ctMu.RUnlock()
+		}
+	}()
+}
+
+const bufSize = 1024
+
+var once sync.Once
+
+// transfer will attempt to contact the destination host several times
+// before return an error
+func (proxy *ProxyHttpServer) transfer(ctx *ProxyCtx, client net.Conn, host string) error {
+	now := time.Now()
+	once.Do(reportOpenTransfers)
+	targetSiteCon, err := proxy.connectDial("tcp", host)
+	if err != nil {
+		httpError(client, ctx, err)
+		return err
+	}
+
+	var sdone, cdone bool
+	done := make(chan error)
+	ctMu.Lock()
+	currentTransfers++
+	cur := id()
+	ctMu.Unlock()
+	fmt.Printf("[%s] %9s Start %s\n", cur, time.Since(now), host)
+
+	ctx.Logf("Accepting CONNECT to %s", host)
+	client.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
+	fmt.Printf("[%s] %9s Connect written\n", cur, time.Since(now))
+	go func() {
+		var sum int64
+		var err error
+		for {
+			n, err := io.CopyN(targetSiteCon, client, bufSize)
+			sum += n
+			fmt.Printf("[%s] Partial to server: %d/%d\n", cur, n, sum)
+			if err != nil {
+				break
+			}
+		}
+		// At this point, the client has acknowledged transfer and
+		// can be closed.
+		fmt.Printf("[%s] %9s Flushed to server %d: %s\n", cur,
+			time.Since(now), sum, err)
+
+		client.Close()
+		targetSiteCon.Close()
+		cdone = true
+		done <- err
+	}()
+
+	go func() {
+		var sum int64
+		var err error
+		for {
+			n, err := io.CopyN(client, targetSiteCon, bufSize)
+			sum += n
+			fmt.Printf("[%s] Partial to client: %d/%d\n", cur, n, sum)
+			if err != nil {
+				break
+			}
+		}
+		fmt.Printf("[%s] %9s Flushed to client %d: %s\n", cur,
+			time.Since(now), sum, err)
+		sdone = true
+	}()
+
+	defer func() {
+		ctMu.Lock()
+		currentTransfers--
+		ctMu.Unlock()
+		fmt.Printf("[%s] %9s closing clients after\n", cur, time.Since(now))
+	}()
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+			fmt.Println(sdone, cdone)
+			if sdone {
+				return nil
+			}
+		case <-time.After(time.Second * 7):
+			fmt.Printf("[%s] %9s Still running host %s srv done? %t cli done? %t\n",
+				cur,
+				time.Since(now),
+				host, sdone, cdone)
+			// We got a response, client is hung
+			if sdone {
+				return nil
+			}
+			continue
+			dur := time.Since(now)
+			if dur > time.Duration(time.Second*30) {
+				// Client can not talk to server
+				if !cdone {
+					return fmt.Errorf("[%s] %9s timeout talking to server", cur, time.Since(now))
+				}
+			}
+			if dur > time.Duration(time.Second*60) {
+				if !sdone {
+					return fmt.Errorf("[%s] %9s timeout waiting for server response", cur, time.Since(now))
+				}
+			}
+		}
+	}
+
+}
+
 func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), proxy: proxy}
 
@@ -91,15 +222,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		if !hasPort.MatchString(host) {
 			host += ":80"
 		}
-		targetSiteCon, err := proxy.connectDial("tcp", host)
+		err := proxy.transfer(ctx, proxyClient, host)
 		if err != nil {
-			httpError(proxyClient, ctx, err)
-			return
+			ctx.Warnf("error request/receiving data: %s", err)
 		}
-		ctx.Logf("Accepting CONNECT to %s", host)
-		proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
-		go copyAndClose(ctx, targetSiteCon, proxyClient)
-		go copyAndClose(ctx, proxyClient, targetSiteCon)
 	case ConnectHijack:
 		ctx.Logf("Hijacking CONNECT to %s", host)
 		proxyClient.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
@@ -257,17 +383,6 @@ func httpError(w io.WriteCloser, ctx *ProxyCtx, err error) {
 	}
 }
 
-func copyAndClose(ctx *ProxyCtx, w, r net.Conn) {
-	connOk := true
-	if _, err := io.Copy(w, r); err != nil {
-		connOk = false
-		ctx.Warnf("Error copying to client: %s", err)
-	}
-	if err := r.Close(); err != nil && connOk {
-		ctx.Warnf("Error closing: %s", err)
-	}
-}
-
 func dialerFromEnv(proxy *ProxyHttpServer) func(network, addr string) (net.Conn, error) {
 	https_proxy := os.Getenv("HTTPS_PROXY")
 	if https_proxy == "" {
@@ -309,6 +424,7 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxy(https_proxy string) func(net
 				c.Close()
 				return nil, err
 			}
+			defer resp.Body.Close()
 			if resp.StatusCode != 200 {
 				resp, _ := ioutil.ReadAll(resp.Body)
 				c.Close()
@@ -333,7 +449,9 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxy(https_proxy string) func(net
 				Host:   addr,
 				Header: make(http.Header),
 			}
+			fmt.Println("Upstream proxy connect", addr)
 			connectReq.Write(c)
+			fmt.Println("Upstream proxy wrote connect request")
 			// Read response.
 			// Okay to use and discard buffered reader here, because
 			// TLS server will not speak until spoken to.
@@ -343,6 +461,8 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxy(https_proxy string) func(net
 				c.Close()
 				return nil, err
 			}
+			bs, err := ioutil.ReadAll(resp.Body)
+			fmt.Println("response ack respond", err, string(bs))
 			if resp.StatusCode != 200 {
 				body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 500))
 				resp.Body.Close()
