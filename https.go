@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -87,11 +88,16 @@ func reportOpenTransfers() {
 
 const bufSize = 1024
 
+var callers int
 var once sync.Once
 
 // transfer will attempt to contact the destination host several times
 // before return an error
 func (proxy *ProxyHttpServer) transfer(ctx *ProxyCtx, client net.Conn, host string) error {
+
+	lastMu := sync.RWMutex{}
+	lastServer := time.Now()
+	lastClient := time.Now()
 	now := time.Now()
 	once.Do(reportOpenTransfers)
 	targetSiteCon, err := proxy.connectDial("tcp", host)
@@ -112,10 +118,19 @@ func (proxy *ProxyHttpServer) transfer(ctx *ProxyCtx, client net.Conn, host stri
 	client.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
 	fmt.Printf("[%s] %9s Connect written\n", cur, time.Since(now))
 	go func() {
+		callers++
+		defer func() { callers-- }()
+		if callers > currentTransfers {
+			log.Println("leaked go routines")
+		}
 		var sum int64
 		var err error
 		for {
 			n, err := io.CopyN(targetSiteCon, client, bufSize)
+			newnow := time.Now()
+			lastMu.Lock()
+			lastServer = newnow
+			lastMu.Unlock()
 			sum += n
 			fmt.Printf("[%s] Partial to server: %d/%d\n", cur, n, sum)
 			if err != nil {
@@ -127,49 +142,48 @@ func (proxy *ProxyHttpServer) transfer(ctx *ProxyCtx, client net.Conn, host stri
 		fmt.Printf("[%s] %9s Flushed to server %d: %s\n", cur,
 			time.Since(now), sum, err)
 
-		client.Close()
-		targetSiteCon.Close()
 		cdone = true
 		done <- err
 	}()
 
 	go func() {
-		var sum int64
+		var n, sum int64
 		var err error
 		for {
-			n, err := io.CopyN(client, targetSiteCon, bufSize)
+			n, err = io.CopyN(client, targetSiteCon, bufSize)
+			newnow := time.Now()
+			lastMu.Lock()
+			lastClient = newnow
+			lastMu.Unlock()
 			sum += n
 			fmt.Printf("[%s] Partial to client: %d/%d\n", cur, n, sum)
 			if err != nil {
+				done <- err
 				break
 			}
 		}
 		fmt.Printf("[%s] %9s Flushed to client %d: %s\n", cur,
 			time.Since(now), sum, err)
 		sdone = true
+		done <- err
 	}()
 
-	defer func() {
-		ctMu.Lock()
-		currentTransfers--
-		ctMu.Unlock()
-		fmt.Printf("[%s] %9s closing clients after\n", cur, time.Since(now))
-	}()
 	for {
 		select {
 		case err := <-done:
-			if err != nil {
+			if err != nil && err != io.EOF {
 				return err
 			}
-			fmt.Println(sdone, cdone)
-			if sdone {
+			if sdone || cdone {
 				return nil
 			}
 		case <-time.After(time.Second * 7):
-			fmt.Printf("[%s] %9s Still running host %s srv done? %t cli done? %t\n",
+			fmt.Printf("[%s] Running: %9s LastS: %9s LastC: %9s srv? %t cli? %t %s\n",
 				cur,
 				time.Since(now),
-				host, sdone, cdone)
+				time.Since(lastServer),
+				time.Since(lastClient),
+				sdone, cdone, host)
 			// We got a response, client is hung
 			if sdone {
 				return nil
@@ -188,6 +202,19 @@ func (proxy *ProxyHttpServer) transfer(ctx *ProxyCtx, client net.Conn, host stri
 				}
 			}
 		}
+	}
+
+	<-done
+	client.Close()
+	targetSiteCon.Close()
+	ctMu.Lock()
+	currentTransfers--
+	ctMu.Unlock()
+	fmt.Printf("[%s] %9s closing clients after\n", cur, time.Since(now))
+	time.Sleep(50 * time.Millisecond)
+	if !cdone || !sdone {
+		log.Printf("[%s] failed to close goroutines\n", cur)
+		panic("boom")
 	}
 
 }
@@ -461,8 +488,6 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxy(https_proxy string) func(net
 				c.Close()
 				return nil, err
 			}
-			bs, err := ioutil.ReadAll(resp.Body)
-			fmt.Println("response ack respond", err, string(bs))
 			if resp.StatusCode != 200 {
 				body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 500))
 				resp.Body.Close()
